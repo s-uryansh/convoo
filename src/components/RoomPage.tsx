@@ -23,6 +23,13 @@ export default function RoomPage({ roomId, username }: RoomPageProps) {
   const peersRef = useRef<Record<string, RTCPeerConnection>>({});
   const initialized = useRef(false);
 
+  const makingOffer = useRef(false);
+  const ignoreOffer = useRef(false);
+  const politePeers = useRef<Record<string,boolean>>({});
+
+  const iceQueueRef = useRef<Record<string, RTCIceCandidateInit[]>>({});
+
+
   const playAudio = async (audioElement: HTMLAudioElement) => {
     try {
       await audioElement.play();
@@ -46,6 +53,8 @@ export default function RoomPage({ roomId, username }: RoomPageProps) {
   
     try {
       await Promise.all(playPromises);
+     
+      
       console.log('All pending audio tracks have been started.');
     } catch (error) {
       console.error('One or more audio elements could not be played after interaction:', error);
@@ -61,6 +70,24 @@ export default function RoomPage({ roomId, username }: RoomPageProps) {
     }, 3000);
   }
 
+
+  async function makeOffer(pc: RTCPeerConnection, otherUser: string) {
+    try {
+      makingOffer.current = true;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socketRef.current?.emit('webrtc-offer', { to: otherUser, sdp: offer });
+      console.log(`📤 Perfect‐negotiation: sent offer to ${otherUser}`);
+    } catch (err) {
+      console.error('Error making offer:', err);
+    } finally {
+      makingOffer.current = false;
+    }
+  }
+
+
+
+
   function initializeSocket() {
     if (socketRef.current?.connected || isConnecting) {
       console.log('Socket already connected or connecting');
@@ -73,16 +100,18 @@ export default function RoomPage({ roomId, username }: RoomPageProps) {
     if (created) {
       setShowPopup(true);
       localStorage.removeItem('justCreatedRoom');
+      
     }
-
+    console.log('Calling initializeSocket at', new Date().toISOString());
     const socket = io({
       path: '/api/socket_io',
       query: {
         roomId,
         username,
       },
+      transports:['polling','websocket'],
       forceNew: true,
-      reconnection: false,
+      reconnection: true,
     });
     
     socketRef.current = socket;
@@ -135,6 +164,7 @@ export default function RoomPage({ roomId, username }: RoomPageProps) {
 
     socket.on('user-left', (name: string) => {
       showToast(`${name} has left the room.`);
+      delete iceQueueRef.current[name];
     });
 
     socket.on('members', (list: string[]) => {
@@ -154,177 +184,208 @@ export default function RoomPage({ roomId, username }: RoomPageProps) {
         return updatedAvatars;
       });
 
-      list.forEach(async otherUser => {
-        if (otherUser === username) return;
-        if (peersRef.current[otherUser]) return;
-       
-        if (username < otherUser) return;
-
-        if (!localStreamRef.current) {
-          console.warn('Local stream not ready yet');
-          return;
-        }
-
-        const pc = new RTCPeerConnection({
-          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-        });
-        peersRef.current[otherUser] = pc;
-
-        pc.onconnectionstatechange = () => {
-          console.log(`Connection with ${otherUser}:`, pc.connectionState);
-        };
-
-        pc.oniceconnectionstatechange = () => {
-          console.log(`ICE connection with ${otherUser}:`, pc.iceConnectionState);
-        };
-
-        localStreamRef.current?.getTracks().forEach(track => {
-          console.log('Adding track to peer connection:', track);
-          pc.addTrack(track, localStreamRef.current!);
-        });
-
-        pc.onicecandidate = e => {
-          if (e.candidate) {
-            socketRef.current?.emit('webrtc-candidate', {
-              to: otherUser,
-              candidate: e.candidate
-            });
-          }
-        };
-
-        pc.ontrack = e => {
-          console.log(`Received track from ${otherUser}`, e.streams[0]);
-          const audioEl = document.getElementById(`audio-${otherUser}`) as HTMLAudioElement;
-          if (audioEl) {
-            audioEl.srcObject = e.streams[0];
-            if (userInteracted) {
-                playAudio(audioEl);
-            } else {
-                console.log(`Audio for ${otherUser} ready, waiting for interaction.`);
-            }
-          } else {
-            console.error(`Audio element not found for ${otherUser}`);
-          }
-        };
-
-        const offer = await pc.createOffer();
-        console.log(`Sending offer to ${otherUser}`);
-        await pc.setLocalDescription(offer);
-        socketRef.current?.emit('webrtc-offer', {
-          to: otherUser,
-          sdp: offer
-        });
-      });
     });
 
     socket.on('webrtc-offer', async ({ from, sdp }) => {
       console.log(`🔥 Received offer from ${from}`);
+      const pc = peersRef.current[from];
+      if (!pc) {
+        console.warn('No PC for offer from', from);
+        return;
+      }
 
-      const pc = new RTCPeerConnection({ iceServers: [{urls : 'stun:stun.l.google.com:19302'}] });
-      peersRef.current[from] = pc;
+      // 1) Politeness logic
+      if (politePeers.current[from] === undefined) {
+        politePeers.current[from] = username < from;
+      }
+      const isPolite = politePeers.current[from]!;
 
-      pc.onconnectionstatechange = () => {
-        console.log(`Connection with ${from}:`, pc.connectionState);
-      };
+      // 2) Collision detection
+      const offerCollision = makingOffer.current || pc.signalingState !== 'stable';
 
-      pc.oniceconnectionstatechange = () => {
-        console.log(`ICE connection with ${from}:`, pc.iceConnectionState);
-      };
+      // 3) If impolite & collision → ignore
+      ignoreOffer.current = !isPolite && offerCollision;
+      if (ignoreOffer.current) {
+        console.log(`- Ignoring offer from ${from} due to collision`);
+        return;
+      }
 
-      localStreamRef.current?.getTracks().forEach(track => {
-        console.log('Adding track to peer connection:', track);
-        pc.addTrack(track, localStreamRef.current!);
-      });
-
-      pc.onicecandidate = e => {
-        if(e.candidate){
-          socket.emit('webrtc-candidate', {to: from, candidate: e.candidate})
-        }
-      };
-
-      pc.ontrack = e => {
-        console.log(`Received track from ${from}`, e.streams[0]);
-        const audioEl = document.getElementById(`audio-${from}`) as HTMLAudioElement;
-        if (audioEl) {
-          audioEl.srcObject = e.streams[0];
-          if (userInteracted) {
-              playAudio(audioEl);
-          } else {
-              console.log(`Audio for ${from} ready, waiting for interaction.`);
-          }
-        } else {
-          console.error(`Audio element not found for ${from}`);
-        }
-      };
-
+      // 4) *Here* we accept the offer…
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+
+      // >>> FLUSH ANY QUEUED ICE CANDIDATES NOW THAT SDP IS APPLIED:
+      const queued = iceQueueRef.current[from] || [];
+      for (const cand of queued) {
+        await pc.addIceCandidate(new RTCIceCandidate(cand));
+      }
+      iceQueueRef.current[from] = [];
+
+      // 5) …then create & send our answer
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      console.log(`📤 Sending answer to ${from}`);
-      socket.emit('webrtc-answer', { to: from, sdp: answer });
+      console.log(`📤 Perfect‐negotiation: sending answer to ${from}`);
+      socketRef.current?.emit('webrtc-answer', { to: from, sdp: answer });
     });
+
+
 
     socket.on('webrtc-answer', async ({ from, sdp }) => {
       console.log(`✅ Received answer from ${from}`);
       const pc = peersRef.current[from];
-      if (pc) {
+
+      if (!pc) {
+        console.warn(`No RTCPeerConnection exists for ${from}`);
+        return;
+      }
+
+      try {
+        // 1) Apply the remote SDP
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        console.log(`📥 Remote answer from ${from} successfully applied.`);
+
+        // 2) <<< FLUSH QUEUED ICE CANDIDATES for this peer now that remoteDescription is set
+        const queued = iceQueueRef.current[from] || [];
+        for (const cand of queued) {
+          await pc.addIceCandidate(new RTCIceCandidate(cand));
+        }
+        iceQueueRef.current[from] = [];
+
+      } catch (err) {
+        console.warn(`⚠️ Failed to apply remote answer from ${from} on first attempt:`, err);
+
+        // Retry after short delay in case of race
+        setTimeout(async () => {
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            console.log(`✅ Remote answer from ${from} successfully applied on retry.`);
+
+            // 3) <<< ALSO FLUSH QUEUED ICE HERE on retry
+            const queuedRetry = iceQueueRef.current[from] || [];
+            for (const cand of queuedRetry) {
+              await pc.addIceCandidate(new RTCIceCandidate(cand));
+            }
+            iceQueueRef.current[from] = [];
+
+          } catch (retryErr) {
+            console.error(`❌ Retry also failed applying remote answer from ${from}:`, retryErr);
+          }
+        }, 100);
       }
     });
 
+
+
     socket.on('webrtc-candidate', async ({ from, candidate }) => {
-      console.log(`🧊 Received ICE candidate from ${from}`);
       const pc = peersRef.current[from];
-      if (pc) {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      if (!pc) return;
+
+      // if we haven’t applied remote SDP yet, queue it
+      if (!pc.remoteDescription) {
+        iceQueueRef.current[from] = iceQueueRef.current[from] || [];
+        iceQueueRef.current[from].push(candidate);
+        return;
       }
+
+      // otherwise, safe to apply
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
     });
+
 
     return () => {
       console.log('Cleaning up socket connection');
       socket.disconnect();
       Object.values(peersRef.current).forEach((pc) => pc.close());
       peersRef.current = {};
+      Object.keys(iceQueueRef.current).forEach((peer) => {
+        delete iceQueueRef.current[peer];
+      });
+
       setIsConnecting(false);
     };
   }
 
   useEffect(() => {
-    if (initialized.current) {
-        return;
-    }
-    initialized.current = true;
-    
-    let cleanup: (() => void) | undefined;
+    console.log('useEffect mount at', new Date().toISOString());
 
-    async function initializeAndConnect() {
-      try {
-        console.log('Requesting microphone access...');
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        localStreamRef.current = stream;
+    // <<< CHANGED: initialize socket immediately, before any async/mic gating
+    const cleanupSocket = initializeSocket();
+
+    // <<< CHANGED: request mic in parallel (no await holding up socket init)
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(stream => {
         console.log('Microphone access granted, tracks:', stream.getTracks().length);
-       
-        cleanup = initializeSocket();
-       
-      } catch (error) {
+        localStreamRef.current = stream;
+      })
+      .catch(error => {
         console.error('Failed to get microphone access:', error);
         showToast('Failed to access microphone');
-      }
-    }
-
-    initializeAndConnect();
+      });
 
     return () => {
-      console.log('Component unmounting, cleaning up...');
-      if (cleanup) {
-        cleanup();
-      }
+      console.log('Component unmounting, cleaning up…');
+
+      // <<< CHANGED: always tear down socket on unmount
+      cleanupSocket?.();
+
+      // stop and clear local tracks
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(track => track.stop());
         localStreamRef.current = null;
       }
     };
   }, [roomId, username]);
+
+
+  useEffect(() => {
+    // 1) Find anyone new you haven’t yet set up
+    const newcomers = members.filter(u => u !== username && !peersRef.current[u]);
+
+    newcomers.forEach(otherUser => {
+      if (!localStreamRef.current) return;
+
+      // 2) Create the RTCPeerConnection and store it
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      peersRef.current[otherUser] = pc;
+
+      // 3) Decide politeness (who initiates)
+      if (politePeers.current[otherUser] === undefined) {
+        politePeers.current[otherUser] = username < otherUser;
+      }
+      const isPolite = politePeers.current[otherUser]!;
+
+      // 4) Wire up ICE‐candidate forwarding
+      pc.onicecandidate = e => {
+        if (e.candidate) {
+          socketRef.current?.emit('webrtc-candidate', {
+            to: otherUser,
+            candidate: e.candidate
+          });
+        }
+      };
+
+      // 5) Handle incoming tracks
+      pc.ontrack = e => {
+        const audioEl = document.getElementById(`audio-${otherUser}`) as HTMLAudioElement;
+        if (audioEl) {
+          audioEl.srcObject = e.streams[0];
+          if (userInteracted) playAudio(audioEl);
+        }
+      };
+
+      // 6) Add your local audio tracks
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current!);
+      });
+
+      // 7) **Only** the polite peer makes the first offer
+      if (isPolite) {
+        makeOffer(pc, otherUser);
+      }
+    });
+  }, [members, username]);
+
 
   const sendMessage = (e: React.FormEvent) => {
     e.preventDefault();

@@ -1,20 +1,21 @@
 'use client';
 
-import React, {useState} from 'react';
+import React, {useState, useEffect} from 'react';
 import Image from 'next/image';
 import { useRouter } from 'next/navigation';
 
 export default function LandingPage(){
-    const [username, setUsername] = useState('');
     const [joinModalOpen, setJoinModalOpen] = useState(false);
     const [joinRoomId, setJoinRoomId] = useState('');
     const router = useRouter()
-    const randomAvatar = () => {
-      const avatars = ['/pfp/1.jpg', '/pfp/2.jpg', '/pfp/3.jpg'];
-      return avatars[Math.floor(Math.random() * avatars.length)];
-    };
-    const [avatar, setAvatar] = useState(randomAvatar());
+    const [username, setUsername] = useState('');
+    const [avatar, setAvatar] = useState<string | null>(null);
 
+    useEffect(() => {
+      const avatars = ['/pfp/1.jpg', '/pfp/2.jpg', '/pfp/3.jpg'];
+      const pick = avatars[Math.floor(Math.random() * avatars.length)];
+      setAvatar(pick);
+    }, []);
 
     //Create Room logic
     const handleCreate = async () => {
@@ -56,7 +57,7 @@ export default function LandingPage(){
             <div className="w-1/3 p-8 flex flex-col items-center bg-gray-800">
                 <div className="w-32 h-32 rounded-full bg-gray-700 mb-6 flex items-center justify-center">
                     <Image
-                      src={avatar}
+                      src={avatar ?? '/pfp/1.jpg'}
                       alt="User Avatar"
                       width={100}
                       height={100}
